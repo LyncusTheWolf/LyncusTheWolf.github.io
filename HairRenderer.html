@@ -1,0 +1,574 @@
+﻿<!DOCTYPE html>
+<!--
+    Kenneth Mitten
+    5/1/2018
+
+    A simplified hair renderer created using the THREE.js library
+    The hair uses a modified verlet algorithm with length constraints
+    to simulate physics. The lighting is calculated using an adaptation
+    of the Kajiya-Kay lighting model used to render hair with semi-realistic
+    accuracy
+
+    TODO: Extract the js snippets and put them into separate js files
+-->
+<html>
+<head>
+    <meta charset=utf-8>
+    <title>Hair Shader</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%
+        }
+    </style>
+</head>
+<body>
+    <canvas id="myCanvas"></canvas>
+    <script src="../Common/three.js"></script>
+    <script src="../Common/dat.gui.min.js"></script>
+
+    <script type="x-shader/x-vertex" id="vertexShader">
+        attribute float strandStepAttr;
+
+        varying vec3 vecPos;
+        varying float strandStep;
+        varying float cosTL;
+        varying float cosTE;
+
+        vec3 lightPos = vec3(10.0, -3.0, 20.0);
+
+        void main(){
+        vecPos = (modelMatrix * vec4(position, 1.0)).xyz;
+        vec3 tangent = (modelViewMatrix * vec4(normal, 0.0)).xyz;
+        vec3 lightDir = normalize(lightPos /* - vecPos*/);
+        vec3 viewDir = normalize(cameraPosition - vecPos);
+        strandStep = strandStepAttr;
+        cosTL = dot(tangent, lightDir);
+        cosTE = dot(tangent, viewDir);
+        gl_Position = projectionMatrix * viewMatrix * vec4(vecPos, 1.0);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="fragmentShader">
+        precision highp float;
+
+        varying vec3 vecPos;
+        varying float cosTL;
+        varying float cosTE;
+        varying float strandStep;
+
+        uniform vec3 baseColor;
+        uniform vec3 ambientLight;
+        uniform float specularIntensity;
+        uniform float diffuseIntensity;
+        uniform float rootShift;
+        uniform float tipShift;
+        uniform float ex1;
+        uniform float ex2;
+        uniform float spec1;
+        uniform float spec2;
+
+        void main(){
+        //http://developer.amd.com/wordpress/media/2012/10/Scheuermann_HairRendering.pdf
+        //http://amd-dev.wpengine.netdna-cdn.com/wordpress/media/2012/10/Scheuermann_HairSketchSlides.pdf
+        //https://nccastaff.bournemouth.ac.uk/jmacey/MastersProjects/MSc13/07/MSc_thesis_On_physically_based_hair_rendering.pdf
+
+        float sinTL = 1.0 - cosTL * cosTL;
+        float diffuse = sinTL;
+
+        float cosTRL = -cosTL;
+        float sinTRL = sinTL;
+        float sinTE = sqrt(1.0 - cosTE * cosTE);
+
+        //Specular related to the lighting shift towards the root
+        float cosTRL_root = cosTRL * cos(rootShift * strandStep) - sinTRL * sin(rootShift * strandStep);
+        float sinTRL_root = sqrt(1.0 - cosTRL_root * cosTRL_root);
+        float specular_root = max(0.0, cosTRL_root * cosTE + sinTRL_root * sinTE);
+
+        //Specular related to the lighting shift towards the tip
+        float cosTRL_tip = cosTRL * cos(tipShift * strandStep) - sinTRL * sin(tipShift * strandStep);
+        float sinTRL_tip = sqrt(1.0 - cosTRL_tip * cosTRL_tip);
+        float specular_tip = max(0.0, cosTRL_tip * cosTE + sinTRL_tip * sinTE);
+
+        //Combine all the calculations (Ambient, Diffuse and both Specular components) into a single final pixel color
+        vec3 finalColor = ambientLight * baseColor +
+        (diffuseIntensity * diffuse * baseColor +
+        specularIntensity * (spec1 * pow(specular_root, ex1) +
+        spec2 * pow(specular_tip, ex2)));
+
+        gl_FragColor = vec4(finalColor, 1.0);
+        }
+    </script>
+
+    <script>
+			//Using 3 control points, generate a bezier curve along a spline at point t->(0 - 1)
+			function bezier(p0, p1, p2, t){
+				var temp0 = p0.clone();
+				var temp1 = p1.clone();
+				var temp2 = p2.clone();
+				var oneMinusT = 1.0 - t;
+
+				temp0.multiplyScalar(oneMinusT * oneMinusT);
+				temp1.multiplyScalar(2.0 * oneMinusT * t);
+				temp2.multiplyScalar(t * t);
+				return temp0.add(temp1).add(temp2);
+			}
+
+			function generateBezier(rootPos, rootNormal, gravity, length, stiffness, delta){
+				var deltaLength = length * delta;
+				var deltaLengthVec = new THREE.Vector3(0, deltaLength, 0);
+				var rootTemp = rootNormal.clone();
+				var gravityTemp = gravity.clone();
+				rootTemp.add(gravityTemp.multiply(deltaLengthVec).multiplyScalar(delta).multiplyScalar(1 - stiffness));
+				return rootTemp.multiplyScalar(deltaLength).add(rootPos);
+			}
+
+			var detailLevel = 20;
+
+			var time;
+
+			//Variables related to the initial scene
+			var timeLastFrame = 0.0;
+			var deltaTime = 0.0;
+			var renderer;
+			var scene;
+			var camera;
+			var myCanvas = document.getElementById('myCanvas');
+
+			//RENDERER
+			renderer = new THREE.WebGLRenderer({canvas: myCanvas, antialias: true});
+			renderer.setClearColor(0xffffff);
+			renderer.setPixelRatio(window.devicePixelRatio);
+			renderer.setSize(window.innerWidth, window.innerHeight);
+
+			//CAMERA
+			camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 500);
+			camera.position.set(0, 0, 100);
+			camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+			//SCENE
+			scene = new THREE.Scene();
+
+			//LIGHTS
+			var light = new THREE.AmbientLight(0xffffff, 0.5);
+			scene.add(light);
+
+			var light = new THREE.PointLight(0xffffff, 1.0);
+			light.position.set(100.0, 25.0, 100.0);
+			scene.add(light);
+
+			//Set up the hair material and create bindings for all the uniforms utilized
+			//in the calculations
+			var material = new THREE.ShaderMaterial({
+				uniforms: {
+					baseColor: new THREE.Uniform(new THREE.Vector3(0.5, 0.3, 0.1)),
+					ambientLight: new THREE.Uniform(new THREE.Vector3(0.3, 0.3, 0.3)),
+					specularIntensity: {value: 0.9},
+					diffuseIntensity: {value: 0.2},
+					rootShift: {value: 0.2},
+					tipShift: {value: 0.8},
+					ex1: {value: 60},
+					ex2: {value: 25},
+					spec1: {value: 0.5},
+					spec2: {value: 0.1}
+				},
+				vertexShader: document.getElementById('vertexShader').textContent,
+				fragmentShader: document.getElementById('fragmentShader').textContent
+			});
+
+			material.needsUpdate = true;
+
+			//Pre calculated detail delta, initialized as one over detail minus one since
+			//the amount of lines constructed per strand is always equal to the number of
+			//vertices minus one
+			var detailDelta = 1.0 / (detailLevel - 1);
+
+			//Variables related to the hairs initial construction and rendering
+			var hairStrandCount = 4000;
+			var positions;
+			var normals;
+			//Two seperate index arrays, one for the stride buffer and one as an attribute buffer
+			var strandSteps;
+			var indices;
+			var curIndex;
+			var stiffness = 0.999;
+			var hairLength = 20.0;
+			var geometry;
+			var line;
+
+			//Using the base parameters of the hair particles generate the data needed to render the bezier splines
+			//Create array buffers for positions, normals (Used as tangents), step positions and indices
+			function initializeParticles(){
+				var gravity = new THREE.Vector3(0.0, gravityMagnitude, 0.0);
+				geometry = new THREE.BufferGeometry();
+
+				positions = [];
+				normals = [];
+				//Two seperate index arrays, one for the stride buffer and one as an attribute buffer
+				strandSteps = [];
+				indices = [];
+				curIndex = 0;
+
+				var piStep = (Math.PI * 2.0 / hairStrandCount);
+
+				//Build the initial geometry
+				for(var j = 0; j < hairStrandCount; j++){
+					var p0 = new THREE.Vector3(Math.sin(j * piStep), 0, Math.cos(j)).multiplyScalar(15);
+					p0.y = 10;
+
+					//Construct the positions arrays
+					for(var i = 0; i < detailLevel; i++){
+						curIndex = j * detailLevel + i;
+
+						//Push the vertex index into the index buffers
+						indices.push(curIndex);
+						strandSteps.push(i / (detailLevel - 1));
+
+						var rootDir = new THREE.Vector3(Math.sin(j * piStep), 0, Math.cos(j * piStep));
+
+						var bezierVec = generateBezier(p0, rootDir, gravity, hairLength, stiffness, i * detailDelta);
+						positions.push(bezierVec.x, bezierVec.y, bezierVec.z);
+
+						if(i < detailLevel - 2){
+							indices.push(curIndex + 1);
+						}
+					}
+
+					//Use the position arrays to construct a normals array
+					for(var i = 0; i < detailLevel; i++){
+						var rootDir;
+
+						var vertIndex = (j * detailLevel + i) * 3;
+
+						if(i == detailLevel - 1){
+							normals.push(normals[vertIndex - 3], normals[vertIndex - 2], normals[vertIndex - 1]);
+						} else {
+							rootDir = (new THREE.Vector3(
+								positions[vertIndex + 3] - positions[vertIndex],
+								positions[vertIndex + 4] - positions[vertIndex + 1],
+								positions[vertIndex + 5] - positions[vertIndex + 2],
+							)).normalize();
+							normals.push(rootDir.x, rootDir.y, rootDir.z);
+						}
+					}
+
+				}
+
+				//Load the constructed data into the geometry for rendering
+				geometry.setIndex(indices);
+				geometry.addAttribute('position', new THREE.Float32BufferAttribute( positions, 3));
+				geometry.addAttribute('normal', new THREE.Float32BufferAttribute( normals, 3));
+				geometry.addAttribute('strandStepAttr', new THREE.Float32BufferAttribute(strandSteps, 1));
+				line = new THREE.LineSegments( geometry, material );
+
+				scene.add( line );
+			}
+
+			initializeParticles();
+
+			var delta = 0.0;
+
+			//Variables related to the hairs physical properties
+			var panSpeed = 0.15;
+			var damping = 0.05;
+			var dampingRange = 0.0;
+			var dampingStep = 5;
+			var windCycle = 3.0;
+			var windMagnitude = 12;
+			var gravityMagnitude = -9.81;
+			var strandLength = 15.0;
+			var windDirection = new THREE.Vector3(1.0, 0.3, 0.2);
+
+			function updatePositions(){
+				positions = line.geometry.attributes.position.array;
+				normals = line.geometry.attributes.normal.array;
+
+				var strandStepLength = strandLength / detailLevel;
+				var windMag = (Math.sin(time * (1 / windCycle) * 2.0 * Math.PI) + 1) * 0.5;
+				var gravityForce = new THREE.Vector3(0.0, gravityMagnitude, 0.0);
+				var windForce = new THREE.Vector3(windDirection.x, windDirection.y, windDirection.z).multiplyScalar(windMag * windMag * windMagnitude);
+				var detailMinusOne = detailLevel - 1;
+
+				//Iterate across all the vertices in the strand
+				for(var j = 0; j < hairStrandCount; j++){
+					//Calculate some damping so that all the hair strands do not move uniformly
+					//This gives the illusion that each strand has it's own physical properties as
+					//well as mimics how some hairs partially block the wind being applied to the
+					//hair behind them
+					var dampingFactor = dampingRange * ((j % dampingStep) / dampingStep) + (1 - dampingRange) *  damping;
+
+					var rootIndex = j * detailLevel;
+
+					var computationPosX = [];
+					var computationPosY = [];
+					var computationPosZ = [];
+
+					//Initialize Local index values;
+					//Unpack the vertices in order to save on computation time
+					for(var i = 0; i < detailLevel; i++){
+						var vertIndex = (j * detailLevel + i) * 3;
+
+						computationPosX.push(positions[vertIndex]);
+						computationPosY.push(positions[vertIndex + 1]);
+						computationPosZ.push(positions[vertIndex + 2]);
+					}
+
+					//Apply forces in positions
+					for(var i = 1; i < detailLevel; i++){
+						var windFactor = /*(j % 5) * */ windForce;
+						var tempX = computationPosX[i] + (windForce.x + gravityForce.x) * deltaTime;
+						tempX += dampingFactor * (computationPosX[i] - tempX);
+						computationPosX[i] = tempX;
+
+						var tempY = computationPosY[i] + (windForce.y + gravityForce.y) * deltaTime;
+						tempY += dampingFactor * (computationPosY[i] - tempY);
+						computationPosY[i] = tempY;
+
+						var tempZ = computationPosZ[i] + (windForce.z + gravityForce.z) * deltaTime;
+						tempZ += dampingFactor * (computationPosZ[i] - tempZ);
+						computationPosZ[i] = tempZ;
+					}
+
+					//Apply length constraints
+					//Using a simple FTL (Follow the leader) algorithm, snap the vertices
+					//back into place to maintain a constant strand length
+					for(var i = 1; i < detailLevel; i++){
+						var dirX;
+						var dirY;
+						var dirZ;
+
+						dirX = computationPosX[i] - computationPosX[i - 1];
+						dirY = computationPosY[i] - computationPosY[i - 1];
+						dirZ = computationPosZ[i] - computationPosZ[i - 1];
+
+						var hLength = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+						var offset = Math.min(hLength, strandStepLength) / hLength;
+
+						computationPosX[i] = computationPosX[i - 1] + dirX * offset;
+						computationPosY[i] = computationPosY[i - 1] + dirY * offset;
+						computationPosZ[i] = computationPosZ[i - 1] + dirZ * offset;
+					}
+
+					//Bake in positions
+					//Repack the vertices into the positions array
+					for(var i = 0; i < detailLevel; i++){
+						var vertIndex = (j * detailLevel + i) * 3;
+
+						positions[vertIndex] = computationPosX[i];
+						positions[vertIndex + 1] = computationPosY[i];
+						positions[vertIndex + 2] = computationPosZ[i];
+					}
+
+					//Bake in normals
+					for(var i = 0; i < detailLevel; i++){
+						var vertIndex = (j * detailLevel + i) * 3;
+
+						//If at the tip, get the normal of the previous vert
+						if(i == detailMinusOne){
+							normals[vertIndex] = normals[vertIndex - 3];
+							normals[vertIndex + 1] = normals[vertIndex - 2];
+							normals[vertIndex + 2] = normals[vertIndex - 1];
+						} else {
+							var normDir = (new THREE.Vector3(
+								computationPosX[i + 1] - computationPosX[i],
+								computationPosY[i + 1] - computationPosY[i],
+								computationPosZ[i + 1] - computationPosZ[i],
+							)).normalize();
+
+							normals[vertIndex] = normDir.x;
+							normals[vertIndex + 1] = normDir.y;
+							normals[vertIndex + 2] = normDir.z;
+						}
+					}
+				}
+
+				line.geometry.attributes.position.needsUpdate = true;
+				line.geometry.attributes.normal.needsUpdate = true;
+			}
+
+			//List of all GUI params relating to properties that can be modified at runtimes
+			param = {
+				"Red Value": line.material.uniforms.baseColor.value.x,
+				"Green Value": line.material.uniforms.baseColor.value.y,
+				"Blue Value": line.material.uniforms.baseColor.value.z,
+				"Ambient Red": line.material.uniforms.ambientLight.value.x,
+				"Ambient Green": line.material.uniforms.ambientLight.value.y,
+				"Ambient Blue": line.material.uniforms.ambientLight.value.z,
+				"Particle Strands": hairStrandCount,
+				"Particle Details": detailLevel,
+				"Strand Length": strandLength,
+				"Damping": damping,
+				"Damping Noise": dampingRange,
+				"Damping Step": dampingStep,
+				"Wind Direction X": windDirection.x,
+				"Wind Direction Y": windDirection.y,
+				"Wind Direction Z": windDirection.z,
+				"Wind Cycle Speed": windCycle,
+				"Wind Magnitude": windMagnitude,
+				"Gravity Magnitude": gravityMagnitude,
+				"Diffuse Intensity" : line.material.uniforms.diffuseIntensity.value,
+				"Specular Intensity" : line.material.uniforms.specularIntensity.value,
+				"Root Shift" : line.material.uniforms.rootShift.value,
+				"Tip Shift" : line.material.uniforms.tipShift.value,
+				"Exp 1" : line.material.uniforms.ex1.value,
+				"Exp 2" : line.material.uniforms.ex2.value,
+				"Spec 1" : line.material.uniforms.spec1.value,
+				"Spec 2" : line.material.uniforms.spec2.value,
+			}
+
+			var gui = new dat.GUI({width: 300});
+			gui.open();
+
+			var colorsFolder = gui.addFolder("Color Values");
+
+			colorsFolder.add(param, "Red Value", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.baseColor.value.x = val;
+			});
+
+			colorsFolder.add(param, "Green Value", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.baseColor.value.y = val;
+			});
+
+			colorsFolder.add(param, "Blue Value", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.baseColor.value.z = val;
+			});
+
+			var lightingFolder = gui.addFolder("Lighting Properries");
+
+			lightingFolder.add(param, "Ambient Red", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.ambientLight.value.x = val;
+			});
+
+			lightingFolder.add(param, "Ambient Green", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.ambientLight.value.y = val;
+			});
+
+			lightingFolder.add(param, "Ambient Blue", 0.0, 1.0).step(0.01).onChange(function(val){
+				line.material.uniforms.ambientLight.value.z = val;
+			});
+
+			var strandFolder = gui.addFolder("Strand Properties");
+
+			strandFolder.add(param, "Particle Strands", 5, 5000).step(1).onChange(function(val){
+				hairStrandCount = val;
+				scene.remove( line );
+				initializeParticles();
+			});
+
+			strandFolder.add(param, "Particle Details", 3, 25).step(1).onChange(function(val){
+				detailLevel = val;
+				scene.remove( line );
+				initializeParticles();
+			});
+
+			strandFolder.add(param, "Strand Length", 0.05, 25.0).step(0.05).onChange(function(val){
+				strandLength = val;
+			});
+
+			strandFolder.add(param, "Damping", 0.0, 1.0).step(0.05).onChange(function(val){
+				damping = val;
+			});
+
+			strandFolder.add(param, "Damping Noise", 0.0, 1.0).step(0.05).onChange(function(val){
+				dampingRange = val;
+			});
+
+			strandFolder.add(param, "Damping Step", 1.0, 10.0).step(1.0).onChange(function(val){
+				dampingStep = val;
+			});
+
+			var forcesFolder = gui.addFolder("Force Properties");
+
+			forcesFolder.add(param, "Wind Direction X", -1.0, 1.0).step(0.01).onChange(function(val){
+				windDirection.x = val;
+			});
+
+			forcesFolder.add(param, "Wind Direction Y", -1.0, 1.0).step(0.01).onChange(function(val){
+				windDirection.y = val;
+			});
+
+			forcesFolder.add(param, "Wind Direction Z", -1.0, 1.0).step(0.01).onChange(function(val){
+				windDirection.z = val;
+			});
+
+			forcesFolder.add(param, "Wind Cycle Speed", 0.1, 30.0).step(0.01).onChange(function(val){
+				windCycle = val;
+			});
+
+			forcesFolder.add(param, "Wind Magnitude", 0.0, 30.0).step(0.05).onChange(function(val){
+				windMagnitude = val;
+			});
+
+			forcesFolder.add(param, "Gravity Magnitude", -25.0, 25.0).step(0.01).onChange(function(val){
+				gravityMagnitude = val;
+			});
+
+			var materialFolder = gui.addFolder("Material Properties");
+
+			materialFolder.add(param, "Diffuse Intensity", 0.0, 1.0).step(0.05).onChange(function(val){
+				line.material.uniforms.diffuseIntensity.value = val;
+			});
+
+			materialFolder.add(param, "Specular Intensity", 0.0, 1.0).step(0.05).onChange(function(val){
+				line.material.uniforms.specularIntensity.value = val;
+			});
+
+			materialFolder.add(param, "Root Shift", 0.0, 10.0).step(0.01).onChange(function(val){
+				line.material.uniforms.rootShift.value = val;
+			});
+
+			materialFolder.add(param, "Tip Shift", 0.0, 10.0).step(0.01).onChange(function(val){
+				line.material.uniforms.tipShift.value = val;
+			});
+
+			materialFolder.add(param, "Exp 1", 0.0, 100.0).step(0.05).onChange(function(val){
+				line.material.uniforms.ex1.value = val;
+			});
+
+			materialFolder.add(param, "Exp 2", 0.0, 100.0).step(0.05).onChange(function(val){
+				line.material.uniforms.ex2.value = val;
+			});
+
+			materialFolder.add(param, "Spec 1", 0.0, 1.0).step(0.05).onChange(function(val){
+				line.material.uniforms.spec1.value = val;
+			});
+
+			materialFolder.add(param, "Spec 2", 0.0, 1.0).step(0.05).onChange(function(val){
+				line.material.uniforms.spec2.value = val;
+			});
+
+			//Open the folders by default
+			colorsFolder.open();
+			lightingFolder.open();
+			strandFolder.open();
+			forcesFolder.open();
+			materialFolder.open();
+
+			//The render loop for the scene
+			function animate() {
+				time = performance.now() * 0.001;
+				deltaTime = time - timeLastFrame;
+				timeLastFrame = time;
+				//delta += 0.01;
+
+				camera.position.set(15, 25, 50);
+				camera.lookAt(new THREE.Vector3(0, -5, 0));
+
+				//camera.position.set(Math.sin(time * panSpeed) * 100, 25, Math.cos(time * panSpeed) * 100);
+				//camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+				requestAnimationFrame( animate );
+
+				updatePositions(deltaTime);
+
+				renderer.render( scene, camera );
+			}
+			animate();
+    </script>
+</body>
+</html>	
